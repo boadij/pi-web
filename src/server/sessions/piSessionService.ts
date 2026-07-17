@@ -3,13 +3,12 @@ import { open, readFile, writeFile } from "node:fs/promises";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
-  AuthStorage,
   createAgentSessionFromServices,
   createAgentSessionRuntime,
   createAgentSessionServices,
   createEditToolDefinition,
   defineTool,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   type CreateAgentSessionRuntimeFactory,
   type EditToolDetails,
@@ -22,7 +21,7 @@ import { SessionCommandService } from "./sessionCommandService.js";
 import { SessionArchiveStore, type ArchivedSessionRecord, type ArchiveSessionInput } from "./sessionArchiveStore.js";
 import { findArchiveCandidateByIdOrPrefix, planSessionArchiveTree, type SessionArchiveTreeCandidate } from "./sessionArchiveTree.js";
 import type { ActiveSession } from "./sessionRuntimeStore.js";
-import { createModelRegistryForAgentDir, type AuthChange } from "./authService.js";
+import type { AuthChange } from "./authService.js";
 import { deterministicSessionName, fallbackSessionName, generateShortSessionName } from "./sessionNameGenerator.js";
 import { computeEditPreview, type EditPreviewResult } from "./editPreview.js";
 import { attachmentsToInlineImages, saveAttachmentsToWorkspace } from "./attachmentService.js";
@@ -167,7 +166,13 @@ interface BulkDeletePlanItem {
 }
 
 type AgentModel = NonNullable<SpawnSessionInvocation["model"]>;
-type ModelRegistryInstance = ReturnType<typeof ModelRegistry.create>;
+
+export interface PiModelRuntime {
+  reloadConfig(): Promise<void>;
+  getAvailableSnapshot(): readonly AgentModel[];
+  getModel(provider: string, modelId: string): AgentModel | undefined;
+  getProviderAuthStatus(providerId: string): { configured: boolean };
+}
 
 export interface PiSessionManager {
   getCwd(): string;
@@ -204,7 +209,7 @@ interface PiExtensionBindings {
 }
 
 export interface PiAgentSession {
-  modelRegistry: ModelRegistryInstance;
+  modelRuntime: PiModelRuntime;
   sessionManager: PiSessionManager;
   scopedModels: readonly { model: AgentModel; thinkingLevel?: ClientThinkingLevel }[];
   sessionId: string;
@@ -331,14 +336,13 @@ export function createPiWebCustomToolDefinitions(
 }
 
 function createDefaultRuntimeFactory(
-  authStorage: AuthStorage,
-  modelRegistry: ModelRegistryInstance,
+  modelRuntime: ModelRuntime,
   sessionManagers: Pick<PiSessionManagerGateway, "open">,
   spawn?: SpawnSessionFn,
   subsessions?: SubsessionToolDeps,
 ): PiWebCreateAgentSessionRuntimeFactory {
   return async ({ cwd, agentDir, sessionManager, sessionStartEvent, initialModel, delegationToolsEnabled }) => {
-    const services = await createAgentSessionServices({ cwd, agentDir, authStorage, modelRegistry });
+    const services = await createAgentSessionServices({ cwd, agentDir, modelRuntime });
     const resolvedDelegationToolsEnabled = delegationToolsEnabled
       ?? await sessionAllowsDelegationTools(sessionManager, sessionManagers);
     const customTools = createPiWebCustomToolDefinitions(cwd, resolvedDelegationToolsEnabled, spawn, subsessions);
@@ -352,6 +356,10 @@ function createDefaultRuntimeFactory(
     return { ...result, services, diagnostics: services.diagnostics };
   };
 }
+
+const missingInjectedRuntimeFactory: PiWebCreateAgentSessionRuntimeFactory = () => Promise.reject(
+  new Error("Injected createAgentRuntime cannot invoke Pi's built-in runtime factory without modelRuntime"),
+);
 
 type PiWebEditToolDetails = EditToolDetails | { preview: EditPreviewResult } | undefined;
 
@@ -377,13 +385,10 @@ function createPiWebEditToolDefinition(cwd: string) {
   });
 }
 
-export interface PiSessionServiceDependencies {
+interface PiSessionServiceBaseDependencies {
   agentDir: string;
   sessionManager: PiSessionManagerGateway;
   archiveStore?: SessionArchiveRepository;
-  createRuntime?: PiWebCreateAgentSessionRuntimeFactory;
-  createAgentRuntime?: CreateAgentRuntime;
-  modelRegistry?: ModelRegistryInstance;
   heartbeatIntervalMs?: number;
   workspaceActivity?: Pick<WorkspaceActivityService, "applySessionStatus" | "applySessionActivity" | "removeSession" | "reconcileSessionActivity">;
   /**
@@ -404,6 +409,13 @@ export interface PiSessionServiceDependencies {
   /** Clock seam for cleanup planning tests. */
   now?: () => Date;
 }
+
+type PiSessionRuntimeDependencies =
+  | { modelRuntime: ModelRuntime; createRuntime?: never; createAgentRuntime?: CreateAgentRuntime }
+  | { modelRuntime?: never; createRuntime: PiWebCreateAgentSessionRuntimeFactory; createAgentRuntime?: CreateAgentRuntime }
+  | { modelRuntime?: ModelRuntime; createRuntime?: PiWebCreateAgentSessionRuntimeFactory; createAgentRuntime: CreateAgentRuntime };
+
+export type PiSessionServiceDependencies = PiSessionServiceBaseDependencies & PiSessionRuntimeDependencies;
 
 export class PiSessionService implements SessionRouteService {
   private readonly active = new Map<string, ActiveSession<PiSessionRuntime>>();
@@ -433,7 +445,6 @@ export class PiSessionService implements SessionRouteService {
   private readonly sessionManager: PiSessionManagerGateway;
   private readonly createRuntime: PiWebCreateAgentSessionRuntimeFactory;
   private readonly createAgentRuntime: CreateAgentRuntime;
-  private readonly modelRegistry: ModelRegistryInstance;
   private readonly workspaceActivity: Pick<WorkspaceActivityService, "applySessionStatus" | "applySessionActivity" | "removeSession" | "reconcileSessionActivity"> | undefined;
   private readonly spawnTargets: SpawnTargetResolver | undefined;
   private readonly logger: PiSessionLogger;
@@ -443,25 +454,25 @@ export class PiSessionService implements SessionRouteService {
     this.archiveStore = deps.archiveStore ?? new SessionArchiveStore();
     this.agentDir = deps.agentDir;
     this.sessionManager = deps.sessionManager;
-    this.modelRegistry = deps.modelRegistry ?? createModelRegistryForAgentDir(this.agentDir);
     this.spawnTargets = deps.spawnTargets;
     this.logger = deps.logger ?? noopLogger;
     this.now = deps.now ?? (() => new Date());
     // Subsessions are a beta capability gated behind their own flag, and they
     // also require the spawn capability (they share its project-scope resolver).
     const subsessionsActive = this.spawnTargets !== undefined && deps.subsessionsEnabled === true;
-    this.createRuntime = deps.createRuntime ?? createDefaultRuntimeFactory(
-      this.modelRegistry.authStorage,
-      this.modelRegistry,
-      this.sessionManager,
-      this.spawnTargets === undefined ? undefined : (input) => this.spawnSession(input),
-      !subsessionsActive ? undefined : {
-        spawn: (input) => this.spawnSubsession(input),
-        list: (parentSessionId, parentSessionFile) => this.listSubsessions(parentSessionId, parentSessionFile),
-        check: (parentSessionId, sessionId, parentSessionFile) => this.checkSubsession(parentSessionId, sessionId, parentSessionFile),
-        read: (parentSessionId, sessionId, query, parentSessionFile) => this.readSubsession(parentSessionId, sessionId, query, parentSessionFile),
-      },
-    );
+    this.createRuntime = deps.createRuntime ?? (deps.modelRuntime === undefined
+      ? missingInjectedRuntimeFactory
+      : createDefaultRuntimeFactory(
+        deps.modelRuntime,
+        this.sessionManager,
+        this.spawnTargets === undefined ? undefined : (input) => this.spawnSession(input),
+        !subsessionsActive ? undefined : {
+          spawn: (input) => this.spawnSubsession(input),
+          list: (parentSessionId, parentSessionFile) => this.listSubsessions(parentSessionId, parentSessionFile),
+          check: (parentSessionId, sessionId, parentSessionFile) => this.checkSubsession(parentSessionId, sessionId, parentSessionFile),
+          read: (parentSessionId, sessionId, query, parentSessionFile) => this.readSubsession(parentSessionId, sessionId, query, parentSessionFile),
+        },
+      ));
     this.createAgentRuntime = deps.createAgentRuntime ?? defaultCreateAgentRuntime;
     this.workspaceActivity = deps.workspaceActivity;
     this.heartbeat = setInterval(() => { this.publishHeartbeats(); }, deps.heartbeatIntervalMs ?? 2000);
@@ -983,22 +994,22 @@ export class PiSessionService implements SessionRouteService {
 
   async availableModels(ref: PiSessionLookup): Promise<ClientSessionModel[]> {
     const session = await this.getOrOpen(ref);
-    session.modelRegistry.refresh();
+    await session.modelRuntime.reloadConfig();
     const models = session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
-      : session.modelRegistry.getAvailable();
+      : session.modelRuntime.getAvailableSnapshot();
     return models.map(modelToClientModel);
   }
 
   async setModel(ref: PiSessionLookup, provider: string, modelId: string): Promise<ClientSessionStatus> {
     await this.assertWritable(ref);
     const session = await this.getOrOpen(ref);
-    session.modelRegistry.refresh();
+    await session.modelRuntime.reloadConfig();
     const candidates = session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
-      : session.modelRegistry.getAvailable();
+      : session.modelRuntime.getAvailableSnapshot();
     const model = candidates.find((candidate) => candidate.provider === provider && candidate.id === modelId)
-      ?? session.modelRegistry.find(provider, modelId);
+      ?? session.modelRuntime.getModel(provider, modelId);
     if (model === undefined) throw new Error(`Model not found: ${provider}/${modelId}`);
     await session.setModel(model);
     this.publishActivity(session, `model: ${model.id}`, "idle", model.provider);
@@ -1837,10 +1848,8 @@ export class PiSessionService implements SessionRouteService {
   }
 
   applyAuthChange(change: AuthChange = {}): void {
-    this.modelRegistry.refresh();
     for (const active of this.active.values()) {
       const { session } = active.runtime;
-      session.modelRegistry.refresh();
       this.syncCurrentModelAuthWarning(session, change.removedProviderId);
       this.publishStatus(session);
     }
@@ -1851,9 +1860,9 @@ export class PiSessionService implements SessionRouteService {
     if (model === undefined) return;
     if (model.provider === "unknown" && model.id === "unknown") return;
     const warningKey = authLossWarningKey(session.sessionId, model.provider, model.id);
-    const registered = session.modelRegistry.find(model.provider, model.id);
+    const registered = session.modelRuntime.getModel(model.provider, model.id);
     if (registered === undefined) return;
-    if (session.modelRegistry.hasConfiguredAuth(registered)) {
+    if (session.modelRuntime.getProviderAuthStatus(model.provider).configured) {
       this.authLossWarnings.delete(warningKey);
       return;
     }

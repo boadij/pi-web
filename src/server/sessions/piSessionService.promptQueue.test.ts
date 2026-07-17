@@ -1,8 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
-import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { PiSessionService } from "./piSessionService.js";
+import { PiSessionService, type PiAgentSession } from "./piSessionService.js";
 import { CapturingSessionEventHub, fakeRuntime, runtimeCreator, sessionGateway, sessionRecord, sessionRef, TEST_MODEL_ID, TEST_MODEL_PROVIDER, testModel, type RuntimeCreator } from "./piSessionService.testSupport.js";
 
 const TEST_AGENT_DIR = "/tmp/pi-web-test-agent";
@@ -336,17 +335,48 @@ describe("PiSessionService prompt, queue, and auth warnings", () => {
     await service.dispose();
   });
 
+  it("reloads model configuration and reads the resulting snapshot", async () => {
+    const firstModel = testModel();
+    const updatedModel = { ...firstModel, id: "updated-model", name: "Updated model" };
+    let snapshot: readonly NonNullable<PiAgentSession["model"]>[] = [firstModel];
+    const reloadConfig = vi.fn(() => {
+      snapshot = [updatedModel];
+      return Promise.resolve();
+    });
+    const modelRuntime: PiAgentSession["modelRuntime"] = {
+      reloadConfig,
+      getAvailableSnapshot: () => snapshot,
+      getModel: (provider: string, modelId: string) => snapshot.find((model) => model.provider === provider && model.id === modelId),
+      getProviderAuthStatus: () => ({ configured: true }),
+    };
+    const fake = fakeRuntime("models-session", { modelRuntime });
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: TEST_AGENT_DIR,
+      createAgentRuntime: runtimeCreator(fake.runtime),
+      sessionManager: sessionGateway([sessionRecord("models-session")]),
+      heartbeatIntervalMs: 60_000,
+    });
+
+    await expect(service.availableModels(sessionRef("models-session"))).resolves.toEqual([expect.objectContaining({ id: "updated-model" })]);
+    expect(reloadConfig).toHaveBeenCalledOnce();
+    await service.dispose();
+  });
+
   it("refreshes auth state and dedupes warnings when logout removes the current model's credentials", async () => {
     const hub = new CapturingSessionEventHub();
-    const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "sk-test" } });
-    const modelRegistry = ModelRegistry.inMemory(authStorage);
-    const model = modelRegistry.find(TEST_MODEL_PROVIDER, TEST_MODEL_ID);
-    if (model === undefined) throw new Error("Expected Anthropic model fixture");
-    const fake = fakeRuntime("auth-session", { model, modelRegistry });
+    let configured = true;
+    const model = testModel();
+    const reloadConfig = vi.fn(() => Promise.resolve());
+    const modelRuntime: PiAgentSession["modelRuntime"] = {
+      reloadConfig,
+      getAvailableSnapshot: () => [model],
+      getModel: (provider: string, modelId: string) => provider === model.provider && modelId === model.id ? model : undefined,
+      getProviderAuthStatus: () => ({ configured }),
+    };
+    const fake = fakeRuntime("auth-session", { model, modelRuntime });
 
     const service = new PiSessionService(hub, {
       agentDir: TEST_AGENT_DIR,
-      modelRegistry,
       createAgentRuntime: runtimeCreator(fake.runtime),
       sessionManager: sessionGateway([sessionRecord("auth-session")]),
       heartbeatIntervalMs: 60_000,
@@ -356,7 +386,7 @@ describe("PiSessionService prompt, queue, and auth warnings", () => {
     hub.sessionEvents.length = 0;
     hub.globalEvents.length = 0;
 
-    authStorage.logout("anthropic");
+    configured = false;
     service.applyAuthChange({ removedProviderId: "anthropic" });
     service.applyAuthChange({ removedProviderId: "anthropic" });
 
@@ -364,11 +394,12 @@ describe("PiSessionService prompt, queue, and auth warnings", () => {
     expect(warningCount()).toBe(1);
     expect(hub.globalEvents.some((event) => event.type === "status.update" && event.status.sessionId === "auth-session")).toBe(true);
 
-    authStorage.set("anthropic", { type: "api_key", key: "sk-new" });
+    configured = true;
     service.applyAuthChange();
-    authStorage.logout("anthropic");
+    configured = false;
     service.applyAuthChange({ removedProviderId: "anthropic" });
     expect(warningCount()).toBe(2);
+    expect(reloadConfig).not.toHaveBeenCalled();
 
     await service.dispose();
   });

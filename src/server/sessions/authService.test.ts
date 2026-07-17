@@ -1,10 +1,11 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AuthInteraction, AuthPrompt, Credential, CredentialStore } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it } from "vitest";
 import type { OAuthFlowState } from "../../shared/apiTypes.js";
-import { AuthService, type AuthChange } from "./authService.js";
+import { AuthService, createModelRuntimeForAgentDir, type AuthChange, type AuthModelRuntime } from "./authService.js";
 import { OAuthLoginFlowService } from "./oauthLoginFlowService.js";
 
 const tempDirs: string[] = [];
@@ -14,91 +15,162 @@ afterEach(async () => {
 });
 
 describe("AuthService", () => {
-  it("saves API keys and emits a global auth change", () => {
-    const { auth, authStorage, changes } = createAuthService();
+  it("saves API keys and emits a global auth change", async () => {
+    const { auth, credentials, changes } = await createAuthService();
 
-    expect(auth.saveApiKey("anthropic", "sk-test")).toEqual({ accepted: true });
+    await expect(auth.saveApiKey("anthropic", "sk-test")).resolves.toEqual({ accepted: true });
 
-    expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "sk-test" });
+    await expect(credentials.read("anthropic")).resolves.toEqual({ type: "api_key", key: "sk-test" });
     expect(changes).toEqual([{}]);
     auth.dispose();
   });
 
-  it("logs out providers and emits the removed provider id", () => {
-    const { auth, authStorage, changes } = createAuthService({ anthropic: { type: "api_key", key: "sk-test" } });
+  it("logs out providers and emits the removed provider id", async () => {
+    const { auth, credentials, changes } = await createAuthService({ anthropic: { type: "api_key", key: "sk-test" } });
 
-    expect(auth.logoutProvider("anthropic")).toEqual({ accepted: true });
+    await expect(auth.logoutProvider("anthropic")).resolves.toEqual({ accepted: true });
 
-    expect(authStorage.get("anthropic")).toBeUndefined();
+    await expect(credentials.read("anthropic")).resolves.toBeUndefined();
     expect(changes).toEqual([{ removedProviderId: "anthropic" }]);
     auth.dispose();
   });
 
-  it("rejects blank API keys", () => {
-    const { auth, changes } = createAuthService();
+  it("rejects blank API keys", async () => {
+    const { auth, changes } = await createAuthService();
 
-    expect(() => { auth.saveApiKey("anthropic", "   "); }).toThrow("API key is required");
+    await expect(auth.saveApiKey("anthropic", "   ")).rejects.toThrow("API key is required");
     expect(changes).toEqual([]);
     auth.dispose();
   });
 
   it("stores credentials in the configured agent directory", async () => {
     const agentDir = await tempAgentDir();
-    const auth = new AuthService({ agentDir });
+    const modelRuntime = await createModelRuntimeForAgentDir(agentDir, false);
+    const auth = new AuthService({ modelRuntime });
 
-    auth.saveApiKey("anthropic", "sk-test");
+    await auth.saveApiKey("anthropic", "sk-test");
 
     await expect(readFile(join(agentDir, "auth.json"), "utf8")).resolves.toContain("sk-test");
     auth.dispose();
   });
 
-  it("refreshes auth state after OAuth login completes", () => {
-    const authStorage = AuthStorage.inMemory();
-    const modelRegistry = ModelRegistry.create(authStorage);
+
+  it("awaits auth-change propagation before completing API-key login", async () => {
+    const runtime = new PromptingAuthRuntime([{ type: "secret", message: "API key" }]);
+    const auth = new AuthService({ modelRuntime: runtime });
+    const propagation = deferred<undefined>();
+    auth.subscribe(() => propagation.promise);
+
+    let settled = false;
+    const saving = auth.saveApiKey("test-provider", "sk-test").finally(() => { settled = true; });
+    await flushMicrotasks();
+
+    expect(settled).toBe(false);
+    propagation.resolve(undefined);
+    await expect(saving).resolves.toEqual({ accepted: true });
+    auth.dispose();
+  });
+
+  it.each([
+    { prompt: { type: "text", message: "Account" } as const, label: "text" },
+    { prompt: { type: "manual_code", message: "Code" } as const, label: "manual-code" },
+    { prompt: { type: "select", message: "Region", options: [{ id: "us", label: "US" }] } as const, label: "select" },
+  ])("rejects a first $label prompt in the API-key endpoint", async ({ prompt }) => {
+    const runtime = new PromptingAuthRuntime([prompt]);
+    const auth = new AuthService({ modelRuntime: runtime });
+
+    await expect(auth.saveApiKey("test-provider", "sk-test")).rejects.toThrow("requires interactive setup");
+    expect(runtime.completedLogins).toBe(0);
+    auth.dispose();
+  });
+
+  it("rejects a second API-key prompt", async () => {
+    const runtime = new PromptingAuthRuntime([
+      { type: "secret", message: "API key" },
+      { type: "text", message: "Account" },
+    ]);
+    const auth = new AuthService({ modelRuntime: runtime });
+
+    await expect(auth.saveApiKey("test-provider", "sk-test")).rejects.toThrow("requires interactive setup");
+    expect(runtime.completedLogins).toBe(0);
+    auth.dispose();
+  });
+
+  it("rejects an aborted API-key prompt", async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const runtime = new PromptingAuthRuntime([{ type: "secret", message: "API key", signal: abort.signal }]);
+    const auth = new AuthService({ modelRuntime: runtime });
+
+    await expect(auth.saveApiKey("test-provider", "sk-test")).rejects.toThrow("Login cancelled");
+    expect(runtime.completedLogins).toBe(0);
+    auth.dispose();
+  });
+
+  it("emits an auth change after OAuth login completes", async () => {
+    const modelRuntime = await ModelRuntime.create({ credentials: new MemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
     const authFlows = new CapturingOAuthLoginFlowService();
-    const auth = new AuthService({ modelRegistry, authFlows });
+    const auth = new AuthService({ modelRuntime, authFlows });
     const changes: AuthChange[] = [];
     auth.subscribe((change) => { changes.push(change); });
-    const reload = vi.spyOn(authStorage, "reload");
-    const refresh = vi.spyOn(modelRegistry, "refresh");
-    const provider = authStorage.getOAuthProviders().find((option) => option.id === "anthropic");
-    if (provider === undefined) throw new Error("Expected built-in OAuth provider");
 
-    expect(auth.startOAuthLogin(provider.id)).toMatchObject({ providerId: provider.id, providerName: provider.name, status: "running" });
+    expect(auth.startOAuthLogin("anthropic")).toMatchObject({ providerId: "anthropic", status: "running" });
 
     const startOptions = authFlows.startCalls.at(0);
     if (startOptions === undefined) throw new Error("Expected OAuth flow to start");
-    expect(startOptions.providerId).toBe(provider.id);
-    expect(startOptions.providerName).toBe(provider.name);
-    expect(startOptions.authStorage).toBe(authStorage);
+    expect(startOptions.providerId).toBe("anthropic");
+    expect(typeof startOptions.login).toBe("function");
     expect(changes).toEqual([]);
 
-    reload.mockClear();
-    refresh.mockClear();
     if (startOptions.onComplete === undefined) throw new Error("Expected OAuth completion callback");
-    startOptions.onComplete();
+    await startOptions.onComplete();
 
-    expect(reload).toHaveBeenCalledOnce();
-    expect(refresh).toHaveBeenCalledOnce();
     expect(changes).toEqual([{}]);
     auth.dispose();
     expect(authFlows.disposed).toBe(true);
   });
 });
 
-function createAuthService(data: Parameters<typeof AuthStorage.inMemory>[0] = {}) {
-  const authStorage = AuthStorage.inMemory(data);
-  const modelRegistry = ModelRegistry.create(authStorage);
-  const auth = new AuthService({ modelRegistry });
+async function createAuthService(data: Record<string, Credential> = {}) {
+  const credentials = new MemoryCredentialStore(data);
+  const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+  const auth = new AuthService({ modelRuntime });
   const changes: AuthChange[] = [];
   auth.subscribe((change) => { changes.push(change); });
-  return { auth, authStorage, changes };
+  return { auth, credentials, changes };
 }
 
 async function tempAgentDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pi-web-auth-agent-"));
   tempDirs.push(dir);
   return dir;
+}
+
+class MemoryCredentialStore implements CredentialStore {
+  private readonly credentials = new Map<string, Credential>();
+
+  constructor(data: Record<string, Credential> = {}) {
+    for (const [providerId, credential] of Object.entries(data)) this.credentials.set(providerId, credential);
+  }
+
+  read(providerId: string): Promise<Credential | undefined> {
+    return Promise.resolve(this.credentials.get(providerId));
+  }
+
+  list(): Promise<readonly { providerId: string; type: Credential["type"] }[]> {
+    return Promise.resolve([...this.credentials].map(([providerId, credential]) => ({ providerId, type: credential.type })));
+  }
+
+  async modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>): Promise<Credential | undefined> {
+    const credential = await fn(this.credentials.get(providerId));
+    if (credential !== undefined) this.credentials.set(providerId, credential);
+    return credential;
+  }
+
+  delete(providerId: string): Promise<void> {
+    this.credentials.delete(providerId);
+    return Promise.resolve();
+  }
 }
 
 class CapturingOAuthLoginFlowService extends OAuthLoginFlowService {
@@ -113,4 +185,51 @@ class CapturingOAuthLoginFlowService extends OAuthLoginFlowService {
   override dispose(): void {
     this.disposed = true;
   }
+}
+
+
+class PromptingAuthRuntime implements AuthModelRuntime {
+  completedLogins = 0;
+
+  constructor(private readonly prompts: readonly AuthPrompt[]) {}
+
+  getProviders() {
+    return [{ id: "test-provider", name: "Test Provider", auth: { apiKey: { login: true }, oauth: true } }];
+  }
+
+  getProvider(providerId: string) {
+    return this.getProviders().find((provider) => provider.id === providerId);
+  }
+
+  listCredentials(): Promise<readonly { providerId: string; type: "api_key" | "oauth" }[]> {
+    return Promise.resolve([]);
+  }
+
+  getProviderAuthStatus() {
+    return { configured: false };
+  }
+
+  async login(_providerId: string, _authType: "api_key" | "oauth", interaction: AuthInteraction): Promise<void> {
+    for (const prompt of this.prompts) await interaction.prompt(prompt);
+    this.completedLogins++;
+  }
+
+  logout(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function deferred<T>() {
+  let resolveValue: (value: T | PromiseLike<T>) => void = () => undefined;
+  let rejectValue: (reason?: unknown) => void = () => undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolveValue = resolve;
+    rejectValue = reject;
+  });
+  return { promise, resolve: resolveValue, reject: rejectValue };
 }
